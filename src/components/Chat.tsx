@@ -52,6 +52,7 @@ function mergeCase(prev: RepairCase, update: RepairCase): RepairCase {
   const next = { ...prev, ...Object.fromEntries(Object.entries(update).filter(([, v]) => v !== undefined)) };
   if (next.modelPageUrl && !isEsparesUrl(next.modelPageUrl)) delete next.modelPageUrl;
   if (next.recommendedParts) next.recommendedParts = next.recommendedParts.filter((p) => isEsparesUrl(p.url));
+  if (next.repairGuides) next.repairGuides = next.repairGuides.filter((g) => isEsparesUrl(g.url));
   return next;
 }
 

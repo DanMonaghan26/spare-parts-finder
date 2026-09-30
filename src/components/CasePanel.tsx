@@ -107,6 +107,27 @@ export function CasePanel({ repair }: { repair: RepairCase }) {
         </section>
       )}
 
+      {repair.repairGuides && repair.repairGuides.length > 0 && (
+        <section>
+          <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">eSpares repair guides</h2>
+          <ul className="space-y-1.5">
+            {repair.repairGuides.map((g, i) => (
+              <li key={i} className="flex gap-2 text-sm">
+                <span aria-hidden>📘</span>
+                <a
+                  href={g.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-teal-700 underline underline-offset-2 hover:text-teal-900 dark:text-teal-400 dark:hover:text-teal-300"
+                >
+                  {g.title}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       {parts.length > 0 && (
         <section>
           <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">Suggested parts</h2>

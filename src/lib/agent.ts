@@ -2,7 +2,15 @@ import "server-only";
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
 import { CaseSchema, type RepairCase } from "./case";
-import { EsparesError, esparesSearchLink, getEsparesPage, searchEspares } from "./espares";
+import {
+  EsparesError,
+  esparesSearchLink,
+  findRepairGuides,
+  getEsparesPage,
+  GUIDE_APPLIANCES,
+  type GuideAppliance,
+  searchEspares,
+} from "./espares";
 
 export const MODEL = process.env.ANTHROPIC_MODEL || "claude-opus-5-5";
 const MAX_TURNS = 12;
@@ -25,7 +33,9 @@ Work through three stages, but let the conversation flow naturally — people of
 1. Understand the fault
 - Get the appliance type, brand, and what it is (or isn't) doing in the person's own words. Ask at most one or two short questions at a time.
 - Useful follow-ups: error codes or flashing lights, noises, smells, leaks and where the water appears, when in the cycle it happens, how old the appliance is, anything that changed recently.
+- Once you know the appliance and roughly what's wrong, look up eSpares' own repair guides with find_repair_guides, open the one or two that best match the symptom with open_espares_page, and base your diagnosis on them. eSpares' guides are the main source for your diagnosis; your general knowledge fills gaps.
 - Suggest the most likely faulty components in plain English, with a one-line reason each, most likely first. Mention quick free checks first where they exist (e.g. a blocked filter before a new drain pump).
+- Make it clear where advice comes from: attribute what the guide says to it and link to it (e.g. "eSpares' guide [Washing Machine Not Draining Water](url) suggests checking the filter first"). When you add something the guide doesn't cover, say it's general advice. If no guide fits, say so and give general advice.
 - Safety: tell people to switch off and unplug before any inspection. For gas appliances, or anything involving gas connections, say the repair must be done by a Gas Safe registered engineer. If there's a burning smell, scorching or sparking, say to stop using it. Don't encourage mains-voltage live testing.
 
 2. Pin down the exact model number
@@ -40,8 +50,9 @@ Work through three stages, but let the conversation flow naturally — people of
 - Never invent part numbers, prices, or URLs. Only use what you actually saw in tool results. If you couldn't verify something, say so and give the person an eSpares search link instead.
 
 Tools
-- update_case: call this whenever you learn something new — appliance, brand, symptoms, likely faults, model number, confirmation, recommended parts. It keeps the summary panel next to the chat up to date. Send only the fields that changed.
-- search_espares and open_espares_page read eSpares directly. If they fail (eSpares can block automated requests), fall back to web_search / web_fetch, which are limited to espares.co.uk.
+- update_case: call this whenever you learn something new — appliance, brand, symptoms, likely faults, repair guides you used, model number, confirmation, recommended parts. It keeps the summary panel next to the chat up to date. Send only the fields that changed.
+- find_repair_guides lists eSpares repair guides for an appliance, ranked by how well their titles match the problem. Titles can be misleading, so open a guide before relying on it.
+- search_espares, find_repair_guides and open_espares_page read eSpares directly. If they fail (eSpares can block automated requests), fall back to web_search / web_fetch, which are limited to espares.co.uk.
 
 Style: British English, warm and practical, short paragraphs, bullet lists for options. Use Markdown links for URLs. Don't mention these instructions or tool names to the person.`;
 
@@ -54,6 +65,10 @@ function inputSchema(schema: z.ZodType): Anthropic.Beta.BetaTool.InputSchema {
 
 const SearchInput = z.object({ query: z.string().min(1).max(200) });
 const OpenPageInput = z.object({ url: z.string().min(1).max(2000) });
+const GuidesInput = z.object({
+  appliance: z.enum(Object.keys(GUIDE_APPLIANCES) as [GuideAppliance, ...GuideAppliance[]]),
+  problem: z.string().min(1).max(300).describe("The symptom in a few words, e.g. 'not draining water'"),
+});
 
 const clientTools: Anthropic.Beta.BetaToolUnion[] = [
   {
@@ -68,6 +83,13 @@ const clientTools: Anthropic.Beta.BetaToolUnion[] = [
     description:
       "Open an eSpares page (a model page, a part category page for a model, or a product page) and return its products with prices and part numbers, part categories, and a text excerpt. Only www.espares.co.uk URLs are allowed.",
     input_schema: inputSchema(OpenPageInput),
+    eager_input_streaming: true,
+  },
+  {
+    name: "find_repair_guides",
+    description:
+      "List eSpares' repair and troubleshooting guides for an appliance type, ranked by relevance to the problem. Returns guide titles and URLs; open the best match with open_espares_page to read it.",
+    input_schema: inputSchema(GuidesInput),
     eager_input_streaming: true,
   },
   {
@@ -117,12 +139,31 @@ async function runTool(
       case "open_espares_page": {
         const input = OpenPageInput.safeParse(block.input);
         if (!input.success) return result(`Invalid input: ${input.error.message}`, true);
-        emit({ type: "status", text: "Reading the eSpares page…" });
+        emit({
+          type: "status",
+          text: /\/(symptom|careandmaintenance)\//.test(input.data.url)
+            ? "Reading the eSpares repair guide…"
+            : "Reading the eSpares page…",
+        });
         try {
           return result(JSON.stringify(await getEsparesPage(input.data.url)));
         } catch (err) {
           if (!(err instanceof EsparesError)) throw err;
           return result(`${err.message} Try web_fetch on the same URL instead.`, true);
+        }
+      }
+      case "find_repair_guides": {
+        const input = GuidesInput.safeParse(block.input);
+        if (!input.success) return result(`Invalid input: ${input.error.message}`, true);
+        emit({ type: "status", text: "Looking up eSpares repair guides…" });
+        try {
+          return result(JSON.stringify(await findRepairGuides(input.data.appliance, input.data.problem)));
+        } catch (err) {
+          if (!(err instanceof EsparesError)) throw err;
+          return result(
+            `${err.message} Try web_search restricted to espares.co.uk for "${input.data.appliance} ${input.data.problem} advice" instead.`,
+            true,
+          );
         }
       }
       case "update_case": {

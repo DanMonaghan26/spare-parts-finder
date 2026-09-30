@@ -24,6 +24,15 @@ export const CaseSchema = z.object({
       }),
     )
     .optional(),
+  repairGuides: z
+    .array(
+      z.object({
+        title: z.string(),
+        url: z.string().describe("eSpares repair guide URL"),
+      }),
+    )
+    .optional()
+    .describe("eSpares repair guides you read and used for the diagnosis"),
   modelNumber: z.string().optional().describe("Model number exactly as on the rating plate"),
   modelConfirmed: z
     .boolean()

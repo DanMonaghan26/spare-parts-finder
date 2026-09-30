@@ -18,6 +18,9 @@ let workingTemplate: string | null = null;
 
 const FETCH_TIMEOUT_MS = 12_000;
 const MAX_ITEMS = 15;
+const EXCERPT_CHARS = 2500;
+// Repair guides are long articles; give Claude enough of one to follow it.
+const GUIDE_EXCERPT_CHARS = 9000;
 
 export type EsparesModel = { title: string; url: string };
 export type EsparesProduct = {
@@ -27,6 +30,7 @@ export type EsparesProduct = {
   partNumber?: string;
 };
 export type EsparesCategory = { name: string; url: string };
+export type EsparesGuide = { title: string; url: string };
 
 export type EsparesPage = {
   url: string;
@@ -36,6 +40,7 @@ export type EsparesPage = {
   models: EsparesModel[];
   products: EsparesProduct[];
   categories: EsparesCategory[];
+  guides: EsparesGuide[];
   excerpt: string;
 };
 
@@ -107,6 +112,7 @@ function parsePage(html: string, pageUrl: string): EsparesPage {
   const models = new Map<string, EsparesModel>();
   const products = new Map<string, EsparesProduct>();
   const categories = new Map<string, EsparesCategory>();
+  const guides = new Map<string, EsparesGuide>();
 
   for (const a of root.querySelectorAll("a[href]")) {
     const href = a.getAttribute("href");
@@ -140,6 +146,9 @@ function parsePage(html: string, pageUrl: string): EsparesPage {
       }
     } else if (url.pathname.endsWith("/catalogue.pl") && url.searchParams.get("refine")) {
       if (!categories.has(key)) categories.set(key, { name: text, url: url.toString() });
+    } else if (isGuidePath(url.pathname)) {
+      const existing = guides.get(key);
+      if (!existing || existing.title.length < text.length) guides.set(key, { title: text, url: url.toString() });
     }
   }
 
@@ -178,8 +187,19 @@ function parsePage(html: string, pageUrl: string): EsparesPage {
     models: [...models.values()].slice(0, MAX_ITEMS),
     products: [...products.values()].slice(0, MAX_ITEMS * 2),
     categories: [...categories.values()].slice(0, 40),
-    excerpt: clean(main.text).slice(0, 2500),
+    guides: [...guides.values()].slice(0, 150),
+    excerpt: clean(main.text).slice(0, isGuidePath(new URL(pageUrl).pathname) ? GUIDE_EXCERPT_CHARS : EXCERPT_CHARS),
   };
+}
+
+/**
+ * eSpares repair guides live at e.g.
+ *   /washing-machines/symptom/washing-machine-not-draining-water/advice.pl
+ *   /advice/careandmaintenance/how-to-diagnose-washing-machine-drain-and-pump-problems
+ */
+function isGuidePath(path: string) {
+  return /^\/[^/]+\/(symptom|careandmaintenance)\/[^/]+\/advice\.pl$/.test(path) ||
+    /^\/advice\/(symptom|careandmaintenance)\/[^/]+$/.test(path);
 }
 
 function looksBlocked(page: EsparesPage) {
@@ -223,4 +243,77 @@ export async function getEsparesPage(rawUrl: string): Promise<EsparesPage> {
 /** A link a person can click to run the same search themselves. */
 export function esparesSearchLink(query: string) {
   return (workingTemplate ?? SEARCH_TEMPLATES[0]).replace("{q}", encodeURIComponent(query.trim()));
+}
+
+// eSpares' repair help centre has a hub per appliance type. Some slugs are
+// confirmed (washing-machines, dishwashers, fridges-and-freezers); the others
+// are best guesses, so each appliance tries a couple of shapes.
+export const GUIDE_APPLIANCES = {
+  "washing machine": ["washing-machines"],
+  "washer dryer": ["washer-dryers", "washing-machines"],
+  "tumble dryer": ["tumble-dryers"],
+  dishwasher: ["dishwashers"],
+  "fridge or freezer": ["fridges-and-freezers"],
+  "oven or cooker": ["cookers-and-ovens", "ovens", "cookers"],
+  hob: ["hobs", "cookers-and-ovens"],
+  "cooker hood": ["cooker-hoods"],
+  microwave: ["microwaves"],
+} as const;
+
+export type GuideAppliance = keyof typeof GUIDE_APPLIANCES;
+
+const STOP_WORDS = new Set(
+  "a an and are at be but by does doesnt dont for from has have how i in is isnt it its my not of on or the to too very was when where which why wont with work working".split(" "),
+);
+
+function keywords(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !STOP_WORDS.has(w));
+}
+
+/** Loosely match word forms, e.g. "drain" ~ "draining", "leak" ~ "leaking". */
+function related(a: string, b: string) {
+  const n = Math.min(a.length, b.length, 5);
+  return n >= 4 && a.slice(0, n) === b.slice(0, n);
+}
+
+/** Find eSpares repair guides for an appliance, ranked by relevance to the problem. */
+export async function findRepairGuides(appliance: GuideAppliance, problem: string) {
+  const urls = GUIDE_APPLIANCES[appliance].flatMap((slug) => [
+    `${ORIGIN}/${slug}/advice.pl`,
+    `${ORIGIN}/advice/appliancetype/${slug}`,
+  ]);
+  const pages = await Promise.allSettled(urls.map((u) => getEsparesPage(u)));
+
+  const guides = new Map<string, EsparesGuide>();
+  for (const page of pages) {
+    if (page.status !== "fulfilled") continue;
+    for (const g of page.value.guides) guides.set(g.url, g);
+  }
+  if (guides.size === 0) {
+    const failure = pages.find((p): p is PromiseRejectedResult => p.status === "rejected");
+    throw failure?.reason instanceof EsparesError
+      ? failure.reason
+      : new EsparesError(`Couldn't find eSpares' ${appliance} repair guides.`);
+  }
+
+  const wanted = keywords(problem);
+  const ranked = [...guides.values()]
+    .map((g) => {
+      const words = keywords(`${g.title} ${new URL(g.url).pathname.replace(/[-/]/g, " ")}`);
+      const score =
+        wanted.filter((w) => words.some((x) => related(w, x))).length +
+        (g.url.includes("/symptom/") ? 0.5 : 0);
+      return { ...g, score };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  return {
+    appliance,
+    guides: ranked.slice(0, 10).map(({ title, url }) => ({ title, url })),
+    totalGuidesSeen: guides.size,
+  };
 }
